@@ -1,0 +1,345 @@
+# =============================================================================
+# Agent Pipeline Configuration
+# =============================================================================
+# This file controls the behavior of the Agent pipeline workflows.
+# All values have sensible defaults - customize as needed for your project.
+#
+# INITIALIZATION:
+#   Run `.agent/scripts/init-agent.sh` to replace placeholders with your values.
+#   Placeholders use {{UPPER_SNAKE_CASE}} syntax.
+#
+# VALIDATION:
+#   Run `.agent/scripts/validate-config.sh` to check for errors and warnings.
+# =============================================================================
+
+version: "1.0.0"
+
+# =============================================================================
+# USER GATES
+# =============================================================================
+# Gates control where the pipeline pauses for human approval.
+# When a gate is enabled (true), the pipeline posts a review request and waits
+# for a thumbs-up (👍) reaction before proceeding.
+#
+# Benefits of gates:
+#   - Human oversight at critical decision points
+#   - Opportunity to review artifacts before committing to implementation
+#   - Ability to catch issues early in the pipeline
+#
+# Trade-offs:
+#   - Enabled gates add latency (waiting for human approval)
+#   - Disabled gates allow faster, fully automated execution
+#
+# Recommendation: Enable all gates for new projects, disable selectively as
+# confidence in the pipeline grows.
+#
+gates:
+  # plan_to_tasks: Pause after plan.md is generated
+  # When: The planning phase creates spec.md and plan.md
+  # Review: Check that the plan addresses all requirements correctly
+  # Label when paused: agent:plan-review
+  # Default: true (recommended for all projects)
+  plan_to_tasks: true
+
+  # tasks_to_impl: Pause after tasks.md is generated
+  # When: Tasks have been extracted from the plan
+  # Review: Verify task ordering, dependencies, and completeness
+  # Label when paused: agent:tasks-review
+  # Default: true (recommended for all projects)
+  tasks_to_impl: true
+
+  # impl_to_qa: Pause after implementation completes
+  # When: All tasks in tasks.md have been executed and committed
+  # Review: Code review before QA runs (rarely needed)
+  # Label when paused: agent:impl-complete
+  # Default: false (QA provides the review opportunity)
+  impl_to_qa: false
+
+  # qa_to_pr: Pause after QA passes before creating PR
+  # When: QA tests have passed
+  # Review: Confirm readiness for PR creation
+  # Label when paused: agent:qa-passed
+  # Default: true (gives opportunity to run additional manual tests)
+  qa_to_pr: true
+
+  # checkpoints: Enable checkpoint pauses during implementation
+  # When: After foundational phase, each user story, or custom task IDs
+  # Review: Check implementation progress incrementally
+  # See 'checkpoints' section below for configuration
+  # Default: true (recommended for complex features)
+  checkpoints: true
+
+# =============================================================================
+# TIMEOUTS
+# =============================================================================
+# Maximum wait times before the pipeline takes action (escalation or timeout).
+# All values are in MINUTES.
+#
+# When a timeout expires:
+#   - clarification/approval: Pipeline posts a reminder, then escalates
+#   - task_execution/qa_execution: Pipeline marks as failed and may retry
+#
+# Valid ranges:
+#   - clarification: 60-10080 (1 hour to 7 days)
+#   - approval: 60-10080 (1 hour to 7 days)
+#   - task_execution: 5-120 (5 minutes to 2 hours)
+#   - qa_execution: 10-180 (10 minutes to 3 hours)
+#
+timeouts:
+  # clarification: Max time to wait for user to answer clarification questions
+  # Used during: Planning phase when the agent needs more information
+  # After timeout: Posts reminder, then adds agent:needs-clarification label
+  # Default: 1440 (24 hours)
+  clarification: 1440
+
+  # approval: Max time to wait for user approval at gates
+  # Used during: Any gate where pipeline is waiting for 👍 reaction
+  # After timeout: Posts reminder at 50%, escalates at 100%
+  # Default: 2880 (48 hours)
+  approval: 2880
+
+  # task_execution: Max time for a single task execution
+  # Used during: Implementation phase for each task
+  # After timeout: Marks task as failed, triggers retry logic
+  # Default: 30 (30 minutes)
+  task_execution: 30
+
+  # qa_execution: Max time for the complete QA suite
+  # Used during: QA phase validation
+  # After timeout: Marks QA as failed, generates partial report
+  # Default: 60 (60 minutes)
+  qa_execution: 60
+
+# =============================================================================
+# RETRY CONFIGURATION
+# =============================================================================
+# Auto-retry settings for failed operations before escalating to human.
+#
+# Retry flow:
+#   1. Task/QA fails
+#   2. Wait backoff_seconds (exponential: 30s → 60s → 120s)
+#   3. Retry operation
+#   4. If still failing after max_attempts, add agent:needs-manual-fix label
+#
+# Exponential backoff prevents overwhelming resources during transient failures.
+#
+retry:
+  # max_attempts: Number of retry attempts before escalating
+  # Valid range: 1-10
+  # Recommendation: 3 for most projects (balances reliability vs latency)
+  # Default: 3
+  max_attempts: 3
+
+  # backoff_seconds: Initial delay before first retry (doubles each attempt)
+  # Valid range: 10-300 (10 seconds to 5 minutes)
+  # Example with 30s: 30s → 60s → 120s → 240s
+  # Default: 30
+  backoff_seconds: 30
+
+# =============================================================================
+# CHECKPOINT CONFIGURATION
+# =============================================================================
+# Checkpoints pause implementation at key milestones for review.
+# This allows incremental review of large implementations.
+#
+# Checkpoint flow:
+#   1. Task completes
+#   2. If checkpoint condition met, pause and post review comment
+#   3. Wait for user 👍 reaction to continue
+#   4. Resume implementation
+#
+# Requires: gates.checkpoints = true
+#
+checkpoints:
+  # after_foundation: Pause after foundational/setup tasks complete
+  # Typically: After project structure, config files, dependencies are set up
+  # Review: Verify foundation is solid before building features
+  # Default: true
+  after_foundation: true
+
+  # after_each_story: Pause after each user story completes
+  # User stories: Groups of related tasks in tasks.md marked with [US1], [US2], etc.
+  # Review: Verify story implementation before moving to next
+  # Default: true
+  after_each_story: true
+
+  # custom: Specific task IDs to pause at
+  # Format: Array of task IDs from tasks.md (e.g., ["T005", "T012", "T025"])
+  # Use when: Specific tasks are critical and need review
+  # Default: [] (no custom checkpoints)
+  custom: []
+
+# =============================================================================
+# INTAKE CONFIGURATION
+# =============================================================================
+# Controls Phase 0 behavior: issue validation and initial planning.
+#
+# The intake phase:
+#   1. Creates a feature branch from the issue
+#   2. Saves the issue as a spec markdown file
+#   3. Runs /speckit.plan non-interactively to validate and plan
+#   4. Gates progression based on result quality
+#
+# If the issue is under-specified, the agent:needs-supplement label is added
+# and the pipeline waits for the user to edit the issue description.
+#
+intake:
+  # skip_plan_review: Skip the plan-review user gate after successful intake
+  # When true: After /speckit.plan succeeds, proceed directly to task generation
+  # When false: Pause for user to review plan artifacts before tasks
+  # Default: false (user reviews plan before tasks are generated)
+  skip_plan_review: false
+
+  # save_raw_issue: Save the original issue body as issue.md alongside the spec
+  # Useful for audit trail and comparing original request to generated spec
+  # Default: true
+  save_raw_issue: true
+
+  # max_clarifications: Maximum NEEDS CLARIFICATION markers before failing validation
+  # If /speckit.plan produces more than this many markers, the spec is considered
+  # under-specified and the issue is labeled agent:needs-supplement
+  # Valid range: 0-10 (0 means no clarifications allowed)
+  # Default: 3
+  max_clarifications: 3
+
+  # min_user_stories: Minimum user stories required in the issue for validation
+  # The intake checks if the issue contains at least this many user stories
+  # or acceptance scenarios before proceeding
+  # Valid range: 0-5 (0 disables this check)
+  # Default: 1
+  min_user_stories: 1
+
+# =============================================================================
+# BRANCH NAMING
+# =============================================================================
+# Controls how feature branches are named when created by the pipeline.
+#
+branch:
+  # prefix: Branch name prefix
+  # Common values: "feature/", "feat/", "agent/"
+  # Default: "feature/"
+  prefix: "feature/"
+
+  # pattern: Branch name pattern after prefix
+  # Variables:
+  #   {issue} - Issue number (e.g., 42)
+  #   {slug}  - Slugified issue title (e.g., add-user-auth)
+  # Examples:
+  #   "{issue}-{slug}" → feature/42-add-user-auth
+  #   "{slug}"         → feature/add-user-auth
+  #   "issue-{issue}"  → feature/issue-42
+  # Default: "{issue}-{slug}"
+  pattern: "{issue}-{slug}"
+
+# =============================================================================
+# SPECKIT COMMANDS LOCATION
+# =============================================================================
+# The Agent pipeline calls Claude Code to execute speckit commands during each
+# phase. Your project must provide these commands - this section tells the
+# pipeline where to find them.
+#
+# IMPORTANT: The .agent/ folder provides pipeline orchestration only.
+# Your project provides the actual commands that define WHAT Claude Code does.
+#
+# Required commands (at minimum):
+#   - /speckit.plan      - Executed during planning phase
+#   - /speckit.tasks     - Executed during task generation
+#   - /speckit.implement - Executed during implementation
+#
+# Directory structure example:
+#   .specify/templates/commands/
+#   ├── plan.md
+#   ├── tasks.md
+#   └── implement.md
+#
+speckit:
+  # commands_path: Path to directory containing speckit command definitions
+  # Relative to repository root
+  # Examples:
+  #   ".specify/templates/commands" - Standard speckit location
+  #   "docs/commands"               - Custom location
+  #   ".claude/commands"            - Alternative convention
+  #
+  # PLACEHOLDER: Replace {{SPECKIT_COMMANDS_PATH}} during init
+  # Default: ".specify/templates/commands"
+  commands_path: ".specify/templates/commands"
+
+  # require_commands: Fail early if commands directory not found
+  # When true: Pipeline fails immediately if commands_path doesn't exist
+  # When false: Pipeline proceeds and lets Claude Code handle missing commands
+  # Recommendation: true (fail fast on misconfiguration)
+  # Default: true
+  require_commands: true
+
+# =============================================================================
+# NOTIFICATIONS (Optional)
+# =============================================================================
+# Configure external notifications for pipeline events.
+# Leave empty or remove section if not using notifications.
+#
+# Events that trigger notifications:
+#   - Pipeline started
+#   - Phase completed
+#   - Approval needed
+#   - Error/escalation
+#   - PR created
+#
+notifications:
+  # slack_webhook: Slack incoming webhook URL for notifications
+  # Setup: Create an incoming webhook in your Slack workspace
+  # Security: Store URL as a GitHub secret (e.g., SLACK_WEBHOOK)
+  # Format: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXX
+  # Leave empty to disable Slack notifications
+  slack_webhook: ""
+
+  # email: Email address for escalation notifications
+  # Used when: Pipeline requires human intervention
+  # Leave empty to disable email notifications
+  email: ""
+
+# =============================================================================
+# PROJECT IDENTIFICATION
+# =============================================================================
+# Project-specific values that must be set during initialization.
+# Run `.agent/scripts/init-agent.sh` to replace these placeholders.
+#
+# PLACEHOLDERS:
+#   {{PROJECT_NAME}}   - Human-readable project name
+#   {{REPO_OWNER}}     - GitHub organization or username
+#   {{REPO_NAME}}      - Repository name
+#   {{DEFAULT_BRANCH}} - Main branch name (typically "main" or "master")
+#
+# =============================================================================
+# RUNNER CONFIGURATION
+# =============================================================================
+# Controls which GitHub Actions runner executes pipeline workflows.
+#
+# All agent workflows use a self-hosted runner group for consistent
+# execution environment and tool availability.
+#
+# Runner group setup:
+#   1. Create a runner group named "agent-developer" in GitHub Settings
+#   2. Add self-hosted runners to the group
+#   3. All workflows will use: runs-on: { group: agent-developer }
+#
+# Fallback: If you prefer GitHub-hosted runners, set AGENT_RUNNER_GROUP
+# repository variable to override:
+#   gh variable set AGENT_RUNNER_GROUP --body "Default"
+#
+# NOTE: Self-hosted runners must have these tools pre-installed:
+#   - jq (>= 1.6)
+#   - yq (>= 4.0)
+#   - gh CLI (>= 2.0, authenticated)
+#   - claude-code or anthropic API access
+#   - Bash 4.0+ (macOS ships with 3.2; install via `brew install bash`)
+#
+runner:
+  # group: Runner group name for all agent workflows
+  # Default: "agent-developer"
+  group: "agent-developer"
+
+project:
+  name: "agent-pipeline-test"
+  repo_owner: "kit-wwk"
+  repo_name: "agent-pipeline-test"
+  default_branch: "main"

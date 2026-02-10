@@ -1,0 +1,546 @@
+# =============================================================================
+# Agent Intake - Phase 0: Issue Validation and Initial Planning
+# =============================================================================
+# This workflow handles the intake phase of the Agent pipeline.
+# It validates the issue, creates a feature branch, saves the issue as a
+# spec markdown file, and runs /speckit.plan non-interactively to validate
+# whether the issue is well-specified enough to proceed.
+#
+# Triggers:
+#   - repository_dispatch: agent-intake event from orchestrator
+#   - issues: edited (re-trigger when user updates issue with needs-supplement)
+#
+# State Machine:
+#   QUEUED -> INTAKE -> SPEC_CREATED (success) -> plan-review or plan-approved
+#   QUEUED -> INTAKE -> NEEDS_SUPPLEMENT (failure) -> user edits -> INTAKE
+#
+# Outputs:
+#   - specs/{feature-id}/issue.md: Raw issue content (audit trail)
+#   - specs/{feature-id}/spec.md: Feature specification
+#   - specs/{feature-id}/plan.md: Implementation plan (if validation passes)
+#   - specs/{feature-id}/research.md: Research decisions (if validation passes)
+#   - specs/{feature-id}/data-model.md: Data model (if applicable)
+# =============================================================================
+
+name: Agent Intake
+
+on:
+  # Dispatched from orchestrator when 'agent' label is added
+  repository_dispatch:
+    types: [agent-intake]
+
+  # Re-trigger when user edits an issue that has agent:needs-supplement label
+  issues:
+    types: [edited]
+
+# Explicit permissions - least privilege principle
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+# Prevent concurrent runs for the same issue
+concurrency:
+  group: agent-intake-${{ github.event.client_payload.feature_id || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Re-trigger Job - Handle issue edits for needs-supplement re-validation
+  # ---------------------------------------------------------------------------
+  retrigger:
+    if: github.event_name == 'issues' && github.event.action == 'edited'
+    runs-on:
+      group: agent-developer
+
+    steps:
+      # Step 1: Check if this issue has the needs-supplement label
+      - name: Check for needs-supplement label
+        id: check
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          LABELS=$(gh issue view "$ISSUE_NUM" --json labels -q '.labels[].name' | tr '\n' ' ')
+
+          if echo "$LABELS" | grep -q "agent:needs-supplement"; then
+            echo "should_retrigger=true" >> $GITHUB_OUTPUT
+            echo "Issue #$ISSUE_NUM has agent:needs-supplement - will re-trigger intake"
+          else
+            echo "should_retrigger=false" >> $GITHUB_OUTPUT
+            echo "Issue #$ISSUE_NUM does not have agent:needs-supplement - skipping"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: Look up the feature_id from existing state
+      - name: Checkout repository
+        if: steps.check.outputs.should_retrigger == 'true'
+        uses: actions/checkout@v4
+
+      # Step 3: Derive feature_id from state files
+      - name: Derive feature ID
+        if: steps.check.outputs.should_retrigger == 'true'
+        id: derive
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+
+          # Search state directory for a state file matching this issue number
+          FEATURE_ID=""
+          if [[ -d ".agent/state" ]]; then
+            for state_file in .agent/state/*/workflow-state.json; do
+              if [[ -f "$state_file" ]]; then
+                FILE_ISSUE=$(jq -r '.issue_number' "$state_file" 2>/dev/null || echo "")
+                if [[ "$FILE_ISSUE" == "$ISSUE_NUM" ]]; then
+                  FEATURE_ID=$(jq -r '.feature_id' "$state_file")
+                  break
+                fi
+              fi
+            done
+          fi
+
+          # Fallback: derive from issue title (same logic as orchestrator)
+          if [[ -z "$FEATURE_ID" ]]; then
+            ISSUE_TITLE=$(gh issue view "$ISSUE_NUM" --json title -q '.title')
+            FEATURE_ID=$(printf "%03d-%s" "$ISSUE_NUM" "$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | head -c 30)")
+          fi
+
+          echo "feature_id=$FEATURE_ID" >> $GITHUB_OUTPUT
+          echo "Derived feature ID: $FEATURE_ID for issue #$ISSUE_NUM"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 4: Update labels and dispatch re-intake
+      - name: Update labels for re-intake
+        if: steps.check.outputs.should_retrigger == 'true'
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --remove-label "agent:needs-supplement" \
+            --add-label "agent:intake"
+
+          gh issue comment "${{ github.event.issue.number }}" --body "$(cat <<'EOF'
+          ## 🔄 Re-validating Issue
+
+          I noticed you updated the issue description. Re-running intake validation...
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 5: Dispatch to intake processing
+      - name: Dispatch re-intake
+        if: steps.check.outputs.should_retrigger == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          event-type: agent-intake
+          client-payload: |
+            {
+              "feature_id": "${{ steps.derive.outputs.feature_id }}",
+              "issue_number": ${{ github.event.issue.number }}
+            }
+
+  # ---------------------------------------------------------------------------
+  # Intake Job - Main intake processing
+  # ---------------------------------------------------------------------------
+  intake:
+    if: github.event_name == 'repository_dispatch'
+    runs-on:
+      group: agent-developer
+
+    env:
+      FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+
+    steps:
+      # Step 1: Checkout repository with full history
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: Install dependencies (jq, yq)
+      # Supports both Linux (apt) and macOS (brew) runners
+      - name: Install dependencies
+        run: |
+          for tool in jq yq; do
+            if command -v "$tool" &> /dev/null; then echo "$tool already installed"; else
+              if command -v apt-get &> /dev/null; then sudo apt-get update && sudo apt-get install -y "$tool"
+              elif command -v brew &> /dev/null; then brew install "$tool"
+              else echo "ERROR: No supported package manager found"; exit 1; fi
+            fi
+          done
+
+      # Step 3: Update labels to show intake phase
+      - name: Update labels
+        run: |
+          gh issue edit "$ISSUE_NUMBER" \
+            --remove-label "agent:queued" \
+            --remove-label "agent:needs-supplement" \
+            --add-label "agent:intake" 2>/dev/null || \
+          gh issue edit "$ISSUE_NUMBER" --add-label "agent:intake"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 4: Create feature branch
+      - name: Create feature branch
+        run: |
+          BRANCH_NAME="feature/${FEATURE_ID}"
+
+          # Check if branch already exists (re-intake scenario)
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "Branch $BRANCH_NAME already exists - checking out"
+            git fetch origin "$BRANCH_NAME"
+            git checkout "$BRANCH_NAME"
+            git pull origin "$BRANCH_NAME" --rebase
+          else
+            echo "Creating new branch: $BRANCH_NAME"
+            git checkout -b "$BRANCH_NAME"
+          fi
+
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      # Step 5: Create specs directory and save issue as markdown
+      - name: Save issue as markdown
+        run: |
+          mkdir -p "specs/${FEATURE_ID}"
+
+          # Fetch issue details
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title')
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
+          ISSUE_AUTHOR=$(gh issue view "$ISSUE_NUMBER" --json author -q '.author.login')
+          ISSUE_CREATED=$(gh issue view "$ISSUE_NUMBER" --json createdAt -q '.createdAt')
+
+          # Read intake config
+          SAVE_RAW=$(yq eval '.intake.save_raw_issue // true' .agent/config.yaml)
+
+          # Save raw issue content as issue.md (audit trail)
+          if [[ "$SAVE_RAW" == "true" ]]; then
+            cat > "specs/${FEATURE_ID}/issue.md" << RAWEOF
+          # Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+
+          **Author**: @${ISSUE_AUTHOR}
+          **Created**: ${ISSUE_CREATED}
+          **Source**: GitHub Issue #${ISSUE_NUMBER}
+
+          ---
+
+          ${ISSUE_BODY}
+          RAWEOF
+            echo "Raw issue saved to specs/${FEATURE_ID}/issue.md"
+          fi
+
+          # Save as structured spec.md using the spec template format
+          cat > "specs/${FEATURE_ID}/spec.md" << SPECEOF
+          # Feature Specification: ${ISSUE_TITLE}
+
+          **Feature Branch**: \`${FEATURE_ID}\`
+          **Created**: $(date +%Y-%m-%d)
+          **Status**: Draft
+          **Input**: GitHub Issue #${ISSUE_NUMBER}
+
+          ## Description
+
+          ${ISSUE_BODY}
+
+          ## Clarifications
+
+          *(To be filled during planning)*
+
+          ## User Scenarios & Testing
+
+          *(To be extracted from issue or defined during planning)*
+
+          ## Requirements
+
+          *(To be analyzed from issue description)*
+
+          ## Success Criteria
+
+          *(To be defined based on acceptance criteria)*
+          SPECEOF
+
+          echo "Spec saved to specs/${FEATURE_ID}/spec.md"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 6: Initial commit - save issue files to branch
+      - name: Commit issue files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "specs/${FEATURE_ID}/"
+          git commit -m "feat(${FEATURE_ID}): Save issue as spec
+
+          - issue.md: Raw issue content (audit trail)
+          - spec.md: Initial feature specification
+
+          Issue: #${ISSUE_NUMBER}" || echo "No changes to commit"
+
+          git push origin "$BRANCH_NAME" --force-with-lease
+
+      # Step 7: Update state to intake phase
+      - name: Update state
+        run: |
+          source .agent/scripts/state-manager.sh
+
+          # Initialize state if it doesn't exist (first intake)
+          if ! state_load "$FEATURE_ID" > /dev/null 2>&1; then
+            state_init "$FEATURE_ID" "$ISSUE_NUMBER"
+          fi
+
+          state_set_phase "$FEATURE_ID" "intake" "validating"
+
+      # Step 8: Run Claude Code /speckit.plan non-interactively
+      # This is the core validation step - if /speckit.plan can produce a valid
+      # plan from the issue content, the spec is well-specified enough to proceed
+      - name: Run Claude Code validation
+        id: claude-plan
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are executing the intake validation phase of the Agent pipeline.
+
+            Feature: ${{ env.FEATURE_ID }}
+            Issue: #${{ env.ISSUE_NUMBER }}
+
+            TASK:
+            1. Read the spec at specs/${{ env.FEATURE_ID }}/spec.md
+            2. Execute /speckit.plan to create an implementation plan
+            3. If the spec lacks sufficient detail for planning (missing user stories,
+               vague requirements, no acceptance criteria), output VALIDATION_FAILED
+               followed by a list of what's missing
+            4. If planning succeeds, output PLAN_COMPLETE
+
+            IMPORTANT: This is a non-interactive execution. Do not ask clarification
+            questions. If information is missing, mark it with [NEEDS CLARIFICATION]
+            and continue. If there are too many unknowns, output VALIDATION_FAILED.
+
+            At the end of your output, include one of these markers on its own line:
+            - PLAN_COMPLETE (if planning succeeded)
+            - VALIDATION_FAILED (if the spec is under-specified)
+          timeout_minutes: 20
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash"
+
+      # Step 9: Evaluate validation results
+      - name: Evaluate results
+        id: evaluate
+        run: |
+          SPECS_DIR="specs/${FEATURE_ID}"
+
+          # Read intake config thresholds
+          MAX_CLARIFICATIONS=$(yq eval '.intake.max_clarifications // 3' .agent/config.yaml)
+          MIN_USER_STORIES=$(yq eval '.intake.min_user_stories // 1' .agent/config.yaml)
+
+          VALIDATION_RESULT="pass"
+          FAILURE_REASONS=""
+
+          # Check 1: Did plan artifacts get created?
+          if [[ ! -f "${SPECS_DIR}/plan.md" ]]; then
+            VALIDATION_RESULT="fail"
+            FAILURE_REASONS="${FAILURE_REASONS}\n- No plan.md was generated"
+          fi
+
+          # Check 2: Count NEEDS CLARIFICATION markers in generated artifacts
+          CLARIFICATION_COUNT=0
+          for artifact in "${SPECS_DIR}"/*.md; do
+            if [[ -f "$artifact" ]]; then
+              COUNT=$(grep -c '\[NEEDS CLARIFICATION' "$artifact" 2>/dev/null || echo "0")
+              CLARIFICATION_COUNT=$((CLARIFICATION_COUNT + COUNT))
+            fi
+          done
+
+          if [[ "$CLARIFICATION_COUNT" -gt "$MAX_CLARIFICATIONS" ]]; then
+            VALIDATION_RESULT="fail"
+            FAILURE_REASONS="${FAILURE_REASONS}\n- Too many unknowns: ${CLARIFICATION_COUNT} NEEDS CLARIFICATION markers (max: ${MAX_CLARIFICATIONS})"
+          fi
+
+          # Check 3: Verify minimum user stories in spec
+          if [[ "$MIN_USER_STORIES" -gt 0 ]]; then
+            STORY_COUNT=$(grep -c -i 'user story\|as a.*i want\|acceptance scenario' "${SPECS_DIR}/spec.md" 2>/dev/null || echo "0")
+            if [[ "$STORY_COUNT" -lt "$MIN_USER_STORIES" ]]; then
+              VALIDATION_RESULT="fail"
+              FAILURE_REASONS="${FAILURE_REASONS}\n- Insufficient user stories: found ${STORY_COUNT} (minimum: ${MIN_USER_STORIES})"
+            fi
+          fi
+
+          # Check 4: Look for VALIDATION_FAILED marker in Claude output
+          # The claude-code-action output is captured in the step result
+          # We check the generated files for indicators
+          if grep -rq 'VALIDATION_FAILED' "${SPECS_DIR}/" 2>/dev/null; then
+            VALIDATION_RESULT="fail"
+            FAILURE_REASONS="${FAILURE_REASONS}\n- Claude Code indicated validation failure"
+          fi
+
+          echo "result=$VALIDATION_RESULT" >> $GITHUB_OUTPUT
+          echo "failure_reasons<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$FAILURE_REASONS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "clarification_count=$CLARIFICATION_COUNT" >> $GITHUB_OUTPUT
+
+          echo "Validation result: $VALIDATION_RESULT"
+          if [[ "$VALIDATION_RESULT" == "fail" ]]; then
+            echo "Failure reasons: $FAILURE_REASONS"
+          fi
+
+      # Step 10a: Handle success - commit artifacts and transition
+      - name: Commit planning artifacts (success)
+        if: steps.evaluate.outputs.result == 'pass'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "specs/${FEATURE_ID}/"
+          git commit -m "feat(${FEATURE_ID}): Add planning artifacts
+
+          - plan.md: Implementation plan
+          - research.md: Research decisions
+          - data-model.md: Data model (if applicable)
+
+          Intake validation: PASSED
+          Issue: #${ISSUE_NUMBER}" || echo "No changes to commit"
+
+          git push origin "$BRANCH_NAME" --force-with-lease
+
+      - name: Update state (success)
+        if: steps.evaluate.outputs.result == 'pass'
+        run: |
+          source .agent/scripts/state-manager.sh
+          state_set_phase "$FEATURE_ID" "spec" "complete"
+
+      - name: Update labels and comment (success)
+        if: steps.evaluate.outputs.result == 'pass'
+        run: |
+          # Read config for plan review gate
+          SKIP_PLAN_REVIEW=$(yq eval '.intake.skip_plan_review // false' .agent/config.yaml)
+
+          # Use label-manager for transition
+          source .agent/scripts/label-manager.sh
+          label_transition_intake_success "$ISSUE_NUMBER" "$SKIP_PLAN_REVIEW"
+
+          # Post success comment
+          if [[ "$SKIP_PLAN_REVIEW" == "true" ]]; then
+            gh issue comment "$ISSUE_NUMBER" --body "$(cat <<'SUCCESSEOF'
+          ## ✅ Intake Validation Passed
+
+          Your issue has been validated and a plan has been generated.
+
+          **Artifacts created:**
+          - 📄 `specs/${{ env.FEATURE_ID }}/spec.md` - Feature specification
+          - 📋 `specs/${{ env.FEATURE_ID }}/plan.md` - Implementation plan
+          - 🔍 `specs/${{ env.FEATURE_ID }}/research.md` - Research decisions
+
+          **Next**: Automatically proceeding to task generation...
+          SUCCESSEOF
+            )"
+          else
+            gh issue comment "$ISSUE_NUMBER" --body "$(cat <<'REVIEWEOF'
+          ## ✅ Intake Validation Passed
+
+          Your issue has been validated and a plan has been generated.
+
+          **Artifacts created:**
+          - 📄 `specs/${{ env.FEATURE_ID }}/spec.md` - Feature specification
+          - 📋 `specs/${{ env.FEATURE_ID }}/plan.md` - Implementation plan
+          - 🔍 `specs/${{ env.FEATURE_ID }}/research.md` - Research decisions
+
+          ---
+
+          **Next Steps:**
+          - React with 👍 to approve the plan and proceed to task generation
+          - Comment with changes if adjustments are needed
+          - React with 👎 to request a complete rethink
+          REVIEWEOF
+            )"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 10b: Dispatch to next phase (if skipping plan review)
+      - name: Dispatch to tasks (skip plan review)
+        if: steps.evaluate.outputs.result == 'pass'
+        run: |
+          SKIP_PLAN_REVIEW=$(yq eval '.intake.skip_plan_review // false' .agent/config.yaml)
+
+          if [[ "$SKIP_PLAN_REVIEW" == "true" ]]; then
+            echo "Skipping plan review gate - dispatching to task generation"
+          else
+            echo "Plan review gate enabled - waiting for user approval"
+            echo "Dispatching phase-complete to orchestrator for state tracking"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch next phase
+        if: steps.evaluate.outputs.result == 'pass'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          event-type: ${{ (steps.evaluate.outputs.result == 'pass') && 'agent-phase-complete' || '' }}
+          client-payload: |
+            {
+              "feature_id": "${{ env.FEATURE_ID }}",
+              "issue_number": ${{ env.ISSUE_NUMBER }},
+              "phase": "intake",
+              "status": "complete"
+            }
+
+      # Step 11: Handle failure - label and comment
+      - name: Update state (failure)
+        if: steps.evaluate.outputs.result == 'fail'
+        run: |
+          source .agent/scripts/state-manager.sh
+          state_set_phase "$FEATURE_ID" "intake" "needs-supplement"
+          state_set_error "$FEATURE_ID" "Intake validation failed" "intake" 0
+
+      - name: Update labels and comment (failure)
+        if: steps.evaluate.outputs.result == 'fail'
+        run: |
+          # Use label-manager for transition
+          source .agent/scripts/label-manager.sh
+          label_transition_needs_supplement "$ISSUE_NUMBER"
+
+          # Build failure comment with reasons
+          REASONS="${{ steps.evaluate.outputs.failure_reasons }}"
+
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat <<FAILEOF
+          ## ⚠️ Intake Validation Failed
+
+          Your issue needs more detail before I can proceed with planning.
+
+          **Issues found:**
+          ${REASONS}
+
+          **What to do:**
+          1. Edit your issue description to add the missing information
+          2. I'll automatically re-validate when you save the changes
+
+          **Tip:** A well-specified issue should include:
+          - Clear feature description
+          - At least one user story (As a... I want... So that...)
+          - Acceptance criteria (Given... When... Then...)
+          - Any technical constraints or preferences
+
+          See the [feature template](.agent/issue-templates/agent-feature.md) for guidance.
+          FAILEOF
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 12: Commit any state changes
+      - name: Commit state changes
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Only commit state files if they exist
+          if [[ -d ".agent/state/${FEATURE_ID}" ]]; then
+            git add ".agent/state/${FEATURE_ID}/" 2>/dev/null || true
+            git commit -m "chore(${FEATURE_ID}): Update pipeline state
+
+          Phase: intake
+          Status: ${{ steps.evaluate.outputs.result || 'unknown' }}
+          Issue: #${ISSUE_NUMBER}" 2>/dev/null || echo "No state changes to commit"
+
+            git push origin "$BRANCH_NAME" --force-with-lease 2>/dev/null || true
+          fi

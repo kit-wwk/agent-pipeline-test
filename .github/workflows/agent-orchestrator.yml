@@ -1,0 +1,387 @@
+# =============================================================================
+# Agent Orchestrator - Event Router for Agent Pipeline
+# =============================================================================
+# This workflow is the main entry point for the Agent pipeline.
+# It routes events to the appropriate phase workflows via repository_dispatch.
+#
+# Triggers:
+#   - issues: labeled with 'agent'
+#   - issue_comment: on issues with 'agent' label
+#   - pull_request_review: on PRs created by the pipeline
+#
+# For each event, it:
+#   1. Loads current state from workflow-state.json
+#   2. Determines the appropriate action based on state and event
+#   3. Dispatches to the specific phase workflow
+#
+# Placeholders:
+#   {{REPO_OWNER}} - GitHub organization or username
+#   {{REPO_NAME}} - Repository name
+# =============================================================================
+
+name: Agent Orchestrator
+
+on:
+  # Triggered when labels are added/removed from issues
+  issues:
+    types: [labeled, unlabeled]
+
+  # Triggered when comments are added to issues
+  issue_comment:
+    types: [created]
+
+  # Triggered by repository_dispatch from phase workflows
+  repository_dispatch:
+    types:
+      - agent-phase-complete
+      - agent-retry
+      - agent-escalate
+
+# Explicit permissions - least privilege principle
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+# Prevent concurrent runs for the same issue
+concurrency:
+  group: agent-${{ github.event.issue.number || github.event.client_payload.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Route Event - Determine what action to take
+  # ---------------------------------------------------------------------------
+  route-event:
+    runs-on:
+      group: agent-developer
+    outputs:
+      action: ${{ steps.determine-action.outputs.action }}
+      feature_id: ${{ steps.determine-action.outputs.feature_id }}
+      issue_number: ${{ steps.determine-action.outputs.issue_number }}
+
+    steps:
+      # Step 1: Checkout repository to access state files and scripts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 2: Install dependencies (jq for JSON processing)
+      # Supports both Linux (apt) and macOS (brew) runners
+      - name: Install dependencies
+        run: |
+          if command -v jq &> /dev/null; then echo "jq already installed"; else
+            if command -v apt-get &> /dev/null; then sudo apt-get update && sudo apt-get install -y jq
+            elif command -v brew &> /dev/null; then brew install jq
+            else echo "ERROR: No supported package manager found"; exit 1; fi
+          fi
+
+      # Step 3: Determine action based on event type and current state
+      - name: Determine action
+        id: determine-action
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.client_payload.issue_number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Event: $EVENT_NAME, Action: $EVENT_ACTION"
+
+          # Default: no action
+          ACTION="none"
+          FEATURE_ID=""
+          ISSUE_NUM="${ISSUE_NUMBER:-0}"
+
+          # Handle label events
+          if [[ "$EVENT_NAME" == "issues" && "$EVENT_ACTION" == "labeled" ]]; then
+            if [[ "$LABEL_NAME" == "agent" ]]; then
+              # New agent request - start pipeline
+              ACTION="start"
+              FEATURE_ID=$(printf "%03d-%s" "$ISSUE_NUM" "$(echo '${{ github.event.issue.title }}' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | head -c 30)")
+            elif [[ "$LABEL_NAME" == agent:* ]]; then
+              # State label changed - might need to trigger next phase
+              ACTION="check-state"
+            fi
+          fi
+
+          # Handle comment events (user reactions, clarifications)
+          if [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            # Check if this issue has the agent label
+            HAS_AGENT_LABEL=$(gh issue view "$ISSUE_NUM" --json labels -q '.labels[].name' | grep -c "^agent$" || echo "0")
+            if [[ "$HAS_AGENT_LABEL" -gt 0 ]]; then
+              ACTION="process-comment"
+            fi
+          fi
+
+          # Handle repository_dispatch events
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            case "${{ github.event.action }}" in
+              agent-phase-complete)
+                ACTION="next-phase"
+                FEATURE_ID="${{ github.event.client_payload.feature_id }}"
+                ;;
+              agent-retry)
+                ACTION="retry"
+                FEATURE_ID="${{ github.event.client_payload.feature_id }}"
+                ;;
+              agent-escalate)
+                ACTION="escalate"
+                FEATURE_ID="${{ github.event.client_payload.feature_id }}"
+                ;;
+            esac
+          fi
+
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+          echo "feature_id=$FEATURE_ID" >> $GITHUB_OUTPUT
+          echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
+
+          echo "Determined action: $ACTION"
+          echo "Feature ID: $FEATURE_ID"
+          echo "Issue: $ISSUE_NUM"
+
+  # ---------------------------------------------------------------------------
+  # Start Pipeline - Initialize new agent request
+  # ---------------------------------------------------------------------------
+  start-pipeline:
+    needs: route-event
+    if: needs.route-event.outputs.action == 'start'
+    runs-on:
+      group: agent-developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Supports both Linux (apt) and macOS (brew) runners
+      - name: Install dependencies
+        run: |
+          for tool in jq yq; do
+            if command -v "$tool" &> /dev/null; then echo "$tool already installed"; else
+              if command -v apt-get &> /dev/null; then sudo apt-get update && sudo apt-get install -y "$tool"
+              elif command -v brew &> /dev/null; then brew install "$tool"
+              else echo "ERROR: No supported package manager found"; exit 1; fi
+            fi
+          done
+
+      # Validate configuration before proceeding
+      - name: Validate configuration
+        run: |
+          echo "Validating Agent pipeline configuration..."
+
+          # Check config.yaml exists
+          if [[ ! -f ".agent/config.yaml" ]]; then
+            echo "ERROR: .agent/config.yaml not found"
+            exit 1
+          fi
+
+          # Check for unreplaced placeholders
+          if grep -q '{{[A-Z_]*}}' .agent/config.yaml; then
+            echo "ERROR: Unreplaced placeholders found in config.yaml"
+            echo "Run .agent/scripts/init-agent.sh to initialize the pipeline"
+            grep '{{[A-Z_]*}}' .agent/config.yaml
+            exit 1
+          fi
+
+          # Validate required fields exist
+          if ! yq eval '.gates' .agent/config.yaml > /dev/null 2>&1; then
+            echo "ERROR: Missing required 'gates' section in config.yaml"
+            exit 1
+          fi
+
+          echo "Configuration validated successfully"
+
+      # Initialize state for this feature
+      - name: Initialize state
+        run: |
+          source .agent/scripts/state-manager.sh
+          state_init "${{ needs.route-event.outputs.feature_id }}" "${{ needs.route-event.outputs.issue_number }}"
+
+      # Add queued label
+      - name: Update labels
+        run: |
+          gh issue edit "${{ needs.route-event.outputs.issue_number }}" --add-label "agent:queued"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Comment on issue
+      - name: Post start comment
+        run: |
+          gh issue comment "${{ needs.route-event.outputs.issue_number }}" --body "$(cat <<'EOF'
+          ## 🤖 Agent Pipeline Started
+
+          I'm processing your feature request. Here's what will happen:
+
+          1. 📋 **Plan** - I'll analyze requirements and create a plan
+          2. 📝 **Tasks** - Break down the plan into executable tasks
+          3. ⚙️ **Implement** - Execute tasks with checkpoints
+          4. 🧪 **QA** - Validate the implementation
+          5. 🔀 **PR** - Create a pull request for review
+
+          **Status**: Queued for processing
+
+          I'll update you as I progress through each phase.
+          EOF
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Dispatch to intake workflow (Phase 0: validate and plan)
+      - name: Dispatch to intake phase
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          event-type: agent-intake
+          client-payload: |
+            {
+              "feature_id": "${{ needs.route-event.outputs.feature_id }}",
+              "issue_number": ${{ needs.route-event.outputs.issue_number }}
+            }
+
+  # ---------------------------------------------------------------------------
+  # Check State - Handle state label changes
+  # ---------------------------------------------------------------------------
+  check-state:
+    needs: route-event
+    if: needs.route-event.outputs.action == 'check-state'
+    runs-on:
+      group: agent-developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for approval reactions
+        id: check-approval
+        run: |
+          # Check for 👍 reactions on the latest bot comment
+          # This is handled by the specific phase workflows
+          echo "State check - delegating to phase workflow"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Process Comment - Handle user replies
+  # ---------------------------------------------------------------------------
+  process-comment:
+    needs: route-event
+    if: needs.route-event.outputs.action == 'process-comment'
+    runs-on:
+      group: agent-developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Process user comment
+        run: |
+          # Determine if this is a clarification response, approval, or other input
+          COMMENT_BODY='${{ github.event.comment.body }}'
+          ISSUE_NUM="${{ needs.route-event.outputs.issue_number }}"
+
+          # Check current labels to determine context
+          LABELS=$(gh issue view "$ISSUE_NUM" --json labels -q '.labels[].name' | tr '\n' ' ')
+
+          if echo "$LABELS" | grep -q "agent:clarification"; then
+            echo "Processing clarification response"
+            # Dispatch to plan workflow to process clarification
+            # The plan workflow will handle this
+          elif echo "$LABELS" | grep -q "agent:needs-manual-fix"; then
+            if echo "$COMMENT_BODY" | grep -qi "fixed"; then
+              echo "User indicated fix is complete"
+              # Dispatch to QA to re-run tests
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Next Phase - Advance to the next pipeline phase
+  # ---------------------------------------------------------------------------
+  next-phase:
+    needs: route-event
+    if: needs.route-event.outputs.action == 'next-phase'
+    runs-on:
+      group: agent-developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Supports both Linux (apt) and macOS (brew) runners
+      - name: Install dependencies
+        run: |
+          if command -v jq &> /dev/null; then echo "jq already installed"; else
+            if command -v apt-get &> /dev/null; then sudo apt-get update && sudo apt-get install -y jq
+            elif command -v brew &> /dev/null; then brew install jq
+            else echo "ERROR: No supported package manager found"; exit 1; fi
+          fi
+
+      - name: Determine next phase
+        id: next-phase
+        run: |
+          source .agent/scripts/state-manager.sh
+          CURRENT_PHASE=$(state_get_phase "${{ needs.route-event.outputs.feature_id }}")
+
+          # Determine next phase based on current
+          case "$CURRENT_PHASE" in
+            queued)
+              NEXT="intake"
+              ;;
+            intake|spec)
+              NEXT="plan"
+              ;;
+            planning)
+              NEXT="tasks"
+              ;;
+            tasks)
+              NEXT="impl"
+              ;;
+            implementing)
+              NEXT="qa"
+              ;;
+            qa)
+              NEXT="pr"
+              ;;
+            pr)
+              NEXT="complete"
+              ;;
+            *)
+              NEXT="none"
+              ;;
+          esac
+
+          echo "next_phase=$NEXT" >> $GITHUB_OUTPUT
+          echo "Current phase: $CURRENT_PHASE -> Next phase: $NEXT"
+
+      - name: Dispatch to next phase
+        if: steps.next-phase.outputs.next_phase != 'none' && steps.next-phase.outputs.next_phase != 'complete'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          event-type: agent-${{ steps.next-phase.outputs.next_phase }}
+          client-payload: |
+            {
+              "feature_id": "${{ needs.route-event.outputs.feature_id }}",
+              "issue_number": ${{ github.event.client_payload.issue_number }}
+            }
+
+      - name: Complete workflow
+        if: steps.next-phase.outputs.next_phase == 'complete'
+        run: |
+          echo "Pipeline complete!"
+          gh issue edit "${{ github.event.client_payload.issue_number }}" \
+            --remove-label "agent:pr-open" \
+            --add-label "agent:complete"
+
+          gh issue comment "${{ github.event.client_payload.issue_number }}" --body "## 🎉 Feature Complete!
+
+          The Agent pipeline has successfully completed. Your feature has been implemented and merged.
+
+          Thank you for using the Agent pipeline!"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

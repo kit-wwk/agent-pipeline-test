@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "GitHub label definitions for Agent pipeline workflow",
+  "labels": [
+    {
+      "name": "agent",
+      "color": "7057ff",
+      "description": "Agent pipeline enabled - triggers automated workflow"
+    },
+    {
+      "name": "agent:queued",
+      "color": "bfdadc",
+      "description": "Queued for processing - issue validated"
+    },
+    {
+      "name": "agent:intake",
+      "color": "1d76db",
+      "description": "Intake processing - validating issue and generating plan"
+    },
+    {
+      "name": "agent:needs-supplement",
+      "color": "d876e3",
+      "description": "Issue needs more detail - update issue description to retry"
+    },
+    {
+      "name": "agent:spec-created",
+      "color": "bfdadc",
+      "description": "Spec generated and committed to feature branch"
+    },
+    {
+      "name": "agent:planning",
+      "color": "1d76db",
+      "description": "Planning phase active - research and design"
+    },
+    {
+      "name": "agent:clarification",
+      "color": "d876e3",
+      "description": "Awaiting user clarification - questions posted"
+    },
+    {
+      "name": "agent:needs-input",
+      "color": "d876e3",
+      "description": "Spec invalid or incomplete - needs user input"
+    },
+    {
+      "name": "agent:plan-review",
+      "color": "fbca04",
+      "description": "Plan ready for review - react 👍 to approve"
+    },
+    {
+      "name": "agent:plan-approved",
+      "color": "0e8a16",
+      "description": "Plan approved by user - proceeding to tasks"
+    },
+    {
+      "name": "agent:generating-tasks",
+      "color": "1d76db",
+      "description": "Task generation in progress"
+    },
+    {
+      "name": "agent:tasks-review",
+      "color": "fbca04",
+      "description": "Tasks ready for review - react 👍 to approve"
+    },
+    {
+      "name": "agent:tasks-approved",
+      "color": "0e8a16",
+      "description": "Tasks approved by user - proceeding to implementation"
+    },
+    {
+      "name": "agent:implementing",
+      "color": "1d76db",
+      "description": "Implementation in progress - executing tasks"
+    },
+    {
+      "name": "agent:checkpoint",
+      "color": "c5def5",
+      "description": "Checkpoint reached - awaiting approval to continue"
+    },
+    {
+      "name": "agent:blocked",
+      "color": "d73a4a",
+      "description": "Blocked - task failed after retries, needs human intervention"
+    },
+    {
+      "name": "agent:impl-complete",
+      "color": "0e8a16",
+      "description": "Implementation complete - all tasks finished"
+    },
+    {
+      "name": "agent:qa-running",
+      "color": "1d76db",
+      "description": "QA tests running - validating implementation"
+    },
+    {
+      "name": "agent:qa-failed",
+      "color": "d73a4a",
+      "description": "QA tests failed - attempting auto-fix"
+    },
+    {
+      "name": "agent:needs-manual-fix",
+      "color": "d73a4a",
+      "description": "Requires manual fix - auto-fix failed after retries"
+    },
+    {
+      "name": "agent:qa-passed",
+      "color": "0e8a16",
+      "description": "QA tests passed - ready for PR creation"
+    },
+    {
+      "name": "agent:pr-approved",
+      "color": "0e8a16",
+      "description": "User approved PR creation - creating pull request"
+    },
+    {
+      "name": "agent:pr-creating",
+      "color": "1d76db",
+      "description": "Creating pull request"
+    },
+    {
+      "name": "agent:pr-open",
+      "color": "1d76db",
+      "description": "Pull request open - awaiting review"
+    },
+    {
+      "name": "agent:complete",
+      "color": "0e8a16",
+      "description": "Workflow complete - PR merged, feature delivered"
+    }
+  ]
+}
