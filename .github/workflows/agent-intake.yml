@@ -295,32 +295,40 @@ jobs:
       # plan from the issue content, the spec is well-specified enough to proceed
       - name: Run Claude Code validation
         id: claude-plan
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            You are executing the intake validation phase of the Agent pipeline.
+        timeout-minutes: 20
+        run: |
+          echo "=== Running Claude Code CLI validation ==="
+          echo "Feature: ${FEATURE_ID}"
+          echo "Working directory: $(pwd)"
 
-            Feature: ${{ env.FEATURE_ID }}
-            Issue: #${{ env.ISSUE_NUMBER }}
+          # Run Claude Code CLI in headless mode
+          # Uses the logged-in session on the self-hosted runner
+          claude -p "You are executing the intake validation phase of the Agent pipeline.
 
-            TASK:
-            1. Read the spec at specs/${{ env.FEATURE_ID }}/spec.md
-            2. Execute /speckit.plan to create an implementation plan
-            3. If the spec lacks sufficient detail for planning (missing user stories,
-               vague requirements, no acceptance criteria), output VALIDATION_FAILED
-               followed by a list of what's missing
-            4. If planning succeeds, output PLAN_COMPLETE
+          Feature: ${FEATURE_ID}
+          Issue: #${ISSUE_NUMBER}
 
-            IMPORTANT: This is a non-interactive execution. Do not ask clarification
-            questions. If information is missing, mark it with [NEEDS CLARIFICATION]
-            and continue. If there are too many unknowns, output VALIDATION_FAILED.
+          TASK:
+          1. Read the spec at specs/${FEATURE_ID}/spec.md
+          2. Execute /speckit.plan to create an implementation plan
+          3. If the spec lacks sufficient detail for planning (missing user stories,
+             vague requirements, no acceptance criteria), output VALIDATION_FAILED
+             followed by a list of what is missing
+          4. If planning succeeds, output PLAN_COMPLETE
 
-            At the end of your output, include one of these markers on its own line:
-            - PLAN_COMPLETE (if planning succeeded)
-            - VALIDATION_FAILED (if the spec is under-specified)
-          timeout_minutes: 20
-          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash"
+          IMPORTANT: This is a non-interactive execution. Do not ask clarification
+          questions. If information is missing, mark it with [NEEDS CLARIFICATION]
+          and continue. If there are too many unknowns, output VALIDATION_FAILED.
+
+          At the end of your output, include one of these markers on its own line:
+          - PLAN_COMPLETE (if planning succeeded)
+          - VALIDATION_FAILED (if the spec is under-specified)" \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(command:*)" \
+            --max-turns 50 \
+            --output-format text \
+            2>&1 | tee /tmp/claude-output.log || true
+
+          echo "=== Claude Code CLI validation complete ==="
 
       # Step 9: Evaluate validation results
       - name: Evaluate results
