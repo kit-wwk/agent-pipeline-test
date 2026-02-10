@@ -50,8 +50,7 @@ jobs:
   # ---------------------------------------------------------------------------
   retrigger:
     if: github.event_name == 'issues' && github.event.action == 'edited'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     steps:
       # Step 1: Check if this issue has the needs-supplement label
@@ -142,8 +141,7 @@ jobs:
   # ---------------------------------------------------------------------------
   intake:
     if: github.event_name == 'repository_dispatch'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     env:
       FEATURE_ID: ${{ github.event.client_payload.feature_id }}

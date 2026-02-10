@@ -53,8 +53,7 @@ jobs:
   # Route Event - Determine what action to take
   # ---------------------------------------------------------------------------
   route-event:
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
     outputs:
       action: ${{ steps.determine-action.outputs.action }}
       feature_id: ${{ steps.determine-action.outputs.feature_id }}
@@ -148,8 +147,7 @@ jobs:
   start-pipeline:
     needs: route-event
     if: needs.route-event.outputs.action == 'start'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository
@@ -247,8 +245,7 @@ jobs:
   check-state:
     needs: route-event
     if: needs.route-event.outputs.action == 'check-state'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository
@@ -269,8 +266,7 @@ jobs:
   process-comment:
     needs: route-event
     if: needs.route-event.outputs.action == 'process-comment'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository
@@ -304,8 +300,7 @@ jobs:
   next-phase:
     needs: route-event
     if: needs.route-event.outputs.action == 'next-phase'
-    runs-on:
-      group: agent-developer
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository
