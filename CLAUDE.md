@@ -23,3 +23,10 @@ specs/                 # Generated feature specs (created by pipeline)
 - Use conventional commits
 - All shell scripts must pass shellcheck
 - YAML files must be valid
+
+## Active Technologies
+- Python 3.11 + FastAPI, uvicorn, pydantic (001-health-endpoint)
+- SQLite (file-based, for health check demonstration) (001-health-endpoint)
+
+## Recent Changes
+- 001-health-endpoint: Added Python 3.11 + FastAPI, uvicorn, pydantic
